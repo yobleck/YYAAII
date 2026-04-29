@@ -1,0 +1,14 @@
+{
+    "model": "gemma3:1b",
+    "stream": true,
+    "keep_alive": "5m",
+    "temp_options": {
+        "num_ctx": 4096
+    },
+    "messages": [
+        {
+            "role": "user",
+            "content": "Can you draw 7 red perpendicular lines some with green ink and some with transparent ink?"
+        }
+    ]
+}
