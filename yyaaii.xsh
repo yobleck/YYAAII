@@ -8,7 +8,8 @@ requires:
 TODO store all config info in the ollama json file
     notes, tts/asr options etc.
 
-TODO generate new json file from scratch
+TODO finish thinking mode
+TODO add or block tool calling
 
 NOTE
 startup
@@ -39,21 +40,45 @@ import requests
 import wcwidth
 try:
     import setproctitle
-    setproctitle.setproctitle("Yobleck's Yet Another Artificial Intelligence Interface")
+    setproctitle.setproctitle("YYAAII")
 except ModuleNotFoundError:
     log("warning: setproctitle not installed")
 
 ### Utils #################################################
-version: str = "0.1.0"
+VERSION: str = "0.1.0"
+LOGGING = True
 
 config: dict = {
-    "editor": "micro",
+    "editor": "subl",  # micro
     "filepicker": ["nnn", "-p", "-"],
     "default_session_dir": "./",
     "llm_api_url": "http://localhost:11434/api/chat",
-    "default_session": '{"model": "filler_model", "stream": false, "temp_options": {"num_ctx": 4096}, "messages": [{"role": "user", "content": "this is filler text"}]}',
-    "auto_start_llm": False,
-    "auto_kill_llm": False,
+    "new_session": """{
+    "model": "filler_model",
+    "stream": true,
+    "think": true,
+    "keep_alive": "5m",
+    "options": {
+        "num_ctx": 4096
+    },
+    "unused_options": {
+        "num_ctx": 4096,
+        "seed": 69,
+        "temperature": 0.8,
+        "num_gpu": 0,
+        "num_thread": 8
+    },
+    "messages": [
+        {
+            "role": "user",
+            "thinking": "left empty on purpose",
+            "content": "this is filler text"
+        }
+    ],
+    "notes": ""
+}""",
+    "auto_start_llm": True,
+    "auto_kill_llm": True,
     "tts_server": "./tts_server.py",
     "auto_start_tts": False,
     "asr_model": "",
@@ -61,15 +86,16 @@ config: dict = {
 }
 
 if len(sys.argv) > 1 and sys.argv[1] in ["h", "-h", "help", "-help", "--help"]:
-    print("""YYAAII $version HELP SCREEN:
+    print(f"""Yobleck's Yet Another Artificial Intelligence Interface {VERSION} HELP SCREEN:
         session files are ollama .json api context files with some extra fields tacked on
         """)
 
 
 def log(i) -> None:
     """Logging function"""
-    with open(f"./yyaaii.log", "a") as f:
-        f.write(f"{time.asctime()}: {str(i)}\n")
+    if LOGGING:
+        with open(f"./yyaaii.log", "a") as f:
+            f.write(f"{time.asctime()}: {str(i)}\n")
 
 
 # check if non python dependencies exist
@@ -98,13 +124,14 @@ def getch(blocking: bool = True, bytes_to_read: int = 1) -> str:
     return ch
 
 
-ctrl_chars = {  # NOTE not using thsi right now. just for reference
+ctrl_chars = {  # NOTE not using this right now. just for reference
     "\x03": "^C", "\x11": "^Q",
     "\x7f": "bk", "\r\n": "en",
     "\x05": "^E", "\x0f": "^O",
     "\x0c": "^L", "\x10": "^P",
     "\x14": "^T", "\x13": "^S",
     "\x17": "^W", "\x19": "^Y",
+    "\x0e": "^N",
 }
 
 
@@ -131,7 +158,7 @@ def handle_esc() -> str:  # TODO only using keys with length 3?
 ### Startup functions #####################################
 def start_llm_server():
     """ make this generic for different providers? probably not"""
-    if not $(pgrep ollama):
+    if !(pgrep ollama).returncode != 0:  # NOTE why does $() throw an error in script but is silent in shell?
         ollama serve 2>&1 > /dev/null &
 
 
@@ -149,11 +176,10 @@ def start_asr_server():
 def load_session() -> str:
     """look for json files in config default dir"""
     file = $(@(config["filepicker"]))
-    if file:
-        return file
-    else:
-        # TODO new session file if file not selected
-        pass
+    # log(type($(stat -c %s @(file))))
+    if $(stat -c %s @(file)) == "0" and file[-5:] == ".json":  # fill empty file
+        $(echo @(config["new_session"]) > @(file))
+    return file
 
 
 ### Functions #############################################
@@ -175,14 +201,17 @@ def append_message_template(role: str) -> None:
     """roles are user and assistant"""
     # using this snippet 3 times. DRY WET?
     j = $(@json jq . @(session))
-    j["messages"].append({"role": role, "content": ""})
+    j["messages"].append({"role": role, "thinking": "", "content": ""})
     with open(session, "w") as f:
         json.dump(j, f, indent=4)
 
 
-def update_last_message(stream_fragment) -> None:
+def update_last_message(stream_fragment, thinking: bool = False) -> None:
     j = $(@json jq . @(session))
-    j["messages"][-1]["content"] += stream_fragment
+    if thinking:
+        j["messages"][-1]["thinking"] += stream_fragment
+    else:
+        j["messages"][-1]["content"] += stream_fragment
     with open(session, "w") as f:
         json.dump(j, f, indent=4)
 
@@ -194,7 +223,14 @@ def send_cxt_to_server():
         r = requests.post(config["llm_api_url"], data=$(jq . @(session)), stream=True)
         append_message_template("assistant")
         for line in r.iter_lines():
-            update_last_message(json.loads(line.decode())["message"]["content"])
+            # TODO handle optional "thinking": "thinking text here",
+            # https://zenn.dev/7shi/articles/fa36989a04c9ed?locale=en
+            log(line)
+            temp_j: dict = json.loads(line.decode())["message"]
+            if "thinking" in temp_j.keys():
+                update_last_message(json.loads(line.decode())["message"]["thinking"], thinking=True)
+            else:
+                update_last_message(json.loads(line.decode())["message"]["content"])
             # if buffer_len > screen_size.lines - 6 then scroll += 1?
             draw_ui(context=True)  # NOTE update in real time. BUG over draws UI bar?
 
@@ -223,7 +259,7 @@ def draw_ui(top_bar=False, context=False, keybinds=False, user_input=False, bot_
 
     print("\x1b[?25l", end="")  # needed but why?
     if top_bar or full_draw:
-        print(f"\x1b[0;0H\x1b[2K┤YYAAII {version}├─┤Session: {session.rsplit('/', 1)[1]}├─┤ Model: {model}├", end="")
+        print(f"\x1b[0;0H\x1b[2K┤YYAAII {VERSION}├─┤Session: {session.rsplit('/', 1)[1]}├─┤ Model: {model}├", end="")
     
     if context or full_draw:
         draw_context_chunk(screen_size, scroll)
@@ -241,7 +277,7 @@ def draw_ui(top_bar=False, context=False, keybinds=False, user_input=False, bot_
               f" \x1b[7m^L\x1b[27m full refresh screen", end="")
     
     if user_input or full_draw:
-        print(f"\x1b[{screen_size.lines - 1};0H\x1b[2K Quick append: {input_buffer}", end="")
+        print(f"\x1b[{screen_size.lines - 1};0H\x1b[2K Quick append: {input_buffer[- (screen_size.columns - 16):]}", end="")
     
     if bot_bar or full_draw:
         print(f"\x1b[{screen_size.lines};0H\x1b[2K└{'─' * (screen_size.columns - 2)}┘", end="")
@@ -328,7 +364,7 @@ while True:
         input_buffer = input_buffer[:-1]
         draw_ui(user_input=True)
 
-    # TODO ^T ^R
+    # TODO ^R
     elif char == "\x14":  # ^T send last message to TTS server
         # send_to_tts_server($(jq .messages[-1].content @(session)))
         with open(session, "r") as f:
@@ -344,7 +380,8 @@ while True:
             scroll += 1
             if scroll > buffer_len - 4:  # leave a bit on screen
                 scroll = buffer_len - 4
-        draw_ui(context=True)  # NOTE awkward. will have to change if handling any other esc seq
+        # NOTE awkward. will have to change if handling any other esc seq
+        draw_ui(context=True)
 
     elif char in string.printable.replace("\n\r", ""):
         input_buffer += char
