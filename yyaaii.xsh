@@ -8,8 +8,9 @@ requires:
 TODO store all config info in the ollama json file
     notes, tts/asr options etc.
 
-TODO finish thinking mode
 TODO add or block tool calling
+
+TODO move all server startup stuff to main runner file?
 
 NOTE
 startup
@@ -45,19 +46,21 @@ except ModuleNotFoundError:
     log("warning: setproctitle not installed")
 
 ### Utils #################################################
-VERSION: str = "0.1.0"
+VERSION: str = "0.3.0"
 LOGGING = True
+# TODO OLLAMA_ENV_VARS=here
 
 config: dict = {
     "editor": "subl",  # micro
     "filepicker": ["nnn", "-p", "-"],
+    "shell": "xonsh",
     "default_session_dir": "./",
     "llm_api_url": "http://localhost:11434/api/chat",
     "new_session": """{
     "model": "filler_model",
     "stream": true,
     "think": true,
-    "keep_alive": "5m",
+    "keep_alive": "10m",
     "options": {
         "num_ctx": 4096
     },
@@ -75,6 +78,7 @@ config: dict = {
             "content": "this is filler text"
         }
     ],
+    "last_known_context_length": 0,
     "notes": ""
 }""",
     "auto_start_llm": True,
@@ -99,10 +103,14 @@ def log(i) -> None:
 
 
 # check if non python dependencies exist
-for prog in ["pgrep", "pkill", "ollama", "jq", "nnn", "unbuffer"]:
+missing_deps = False
+for prog in ["pgrep", "pkill", "stat", "ollama", "jq", "nnn", "unbuffer", "firejail", "switch-netns"]:
     if "not in $PATH or aliases" in $(which @(prog) 2>&1):
         log(f"error: {prog} not found")
-        sys.exit(1)
+        missing_deps = True
+if missing_deps:
+    print("check log for missing dependencies")
+    sys.exit(1)
 
 
 def getch(blocking: bool = True, bytes_to_read: int = 1) -> str:
@@ -131,7 +139,7 @@ ctrl_chars = {  # NOTE not using this right now. just for reference
     "\x0c": "^L", "\x10": "^P",
     "\x14": "^T", "\x13": "^S",
     "\x17": "^W", "\x19": "^Y",
-    "\x0e": "^N",
+    "\x0e": "^N", "\x18": "^X",
 }
 
 
@@ -159,7 +167,11 @@ def handle_esc() -> str:  # TODO only using keys with length 3?
 def start_llm_server():
     """ make this generic for different providers? probably not"""
     if !(pgrep ollama).returncode != 0:  # NOTE why does $() throw an error in script but is silent in shell?
-        ollama serve 2>&1 > /dev/null &
+        print("starting ollama server...")
+        #ollama serve 2>&1 > /dev/null &
+        firejail --profile=ollama_server_sandbox ollama serve 2>&1 > /dev/null &
+        # NOTE firejail doesn't allow nesting
+        # bubblejail run ollama_sandbox ollama serve 2>&1 > /dev/null &
 
 
 def start_tts_server():
@@ -184,12 +196,18 @@ def load_session() -> str:
 
 ### Functions #############################################
 def pick_llm_model() -> str:
-    model_list = $(ollama list).split("\n")[1:-1]
-    model_list = [m.split(" ")[0] for m in model_list]
+    # below requires switch-netns
+    model_list = json.loads($(curl http://localhost:11434/api/tags))
+
     print("\x1b[2J\x1b[H\x1b[?25l")
-    [print(i, m) for i, m in enumerate(model_list)]
+    [print(f"{i}: {m["name"]}",
+        f"size: {m["details"]["parameter_size"]} | " \
+        f"ctx len: {m["details"]["context_length"] if "context_length" in m["details"].keys() else ""}",
+        "caps: " + ", ".join(m["capabilities"]),
+        sep="\n\t")
+    for i, m in enumerate(model_list["models"])]
     selected = input("select model:\n")
-    model = model_list[int(selected)]
+    model = model_list["models"][int(selected)]["name"]
     j = $(@json jq . @(session))
     j["model"] = model
     with open(session, "w") as f:
@@ -208,10 +226,14 @@ def append_message_template(role: str) -> None:
 
 def update_last_message(stream_fragment, thinking: bool = False) -> None:
     j = $(@json jq . @(session))
-    if thinking:
-        j["messages"][-1]["thinking"] += stream_fragment
+
+    if "thinking" in stream_fragment["message"].keys():
+        j["messages"][-1]["thinking"] += stream_fragment["message"]["thinking"]
+    elif stream_fragment["done"]:
+        j["last_known_context_length"] = stream_fragment["eval_count"]
     else:
-        j["messages"][-1]["content"] += stream_fragment
+        j["messages"][-1]["content"] += stream_fragment["message"]["content"]
+
     with open(session, "w") as f:
         json.dump(j, f, indent=4)
 
@@ -220,22 +242,19 @@ def send_cxt_to_server():
     """send the context to the llm server to be processed"""
     # TODO make this async/threaded so user can still scroll? or auto force scroll?
     if $(jq .stream @(session)) == "true":
+        # TODO can this be done inside switch-netns? use curl instead?
         r = requests.post(config["llm_api_url"], data=$(jq . @(session)), stream=True)
         append_message_template("assistant")
         for line in r.iter_lines():
-            # TODO handle optional "thinking": "thinking text here",
+            # handle optional "thinking": "thinking text here",
             # https://zenn.dev/7shi/articles/fa36989a04c9ed?locale=en
             log(line)
-            temp_j: dict = json.loads(line.decode())["message"]
-            if "thinking" in temp_j.keys():
-                update_last_message(json.loads(line.decode())["message"]["thinking"], thinking=True)
-            else:
-                update_last_message(json.loads(line.decode())["message"]["content"])
+            update_last_message(json.loads(line.decode()))
             # if buffer_len > screen_size.lines - 6 then scroll += 1?
             draw_ui(context=True)  # NOTE update in real time. BUG over draws UI bar?
 
     else:
-        # first @ for curl read from file and @ for py->bash
+        # NOTE first @ for curl read from file and @ for py->bash
         reply = $(curl @(config["llm_api_url"]) -d @@(session) 2>/dev/null)
         j = $(@json jq . @(session))
         j["messages"].append(json.loads(reply)["message"])
@@ -266,14 +285,15 @@ def draw_ui(top_bar=False, context=False, keybinds=False, user_input=False, bot_
     
     if keybinds or full_draw:
         print(f"\x1b[{screen_size.lines - 4};0H\x1b[2K┌{'─' * (screen_size.columns - 2)}┐")
-        print(f" \x1b[7m^Q\x1b[27m Quit          "
-              f" \x1b[7m^E\x1b[27m Edit context        "
+        print(f" \x1b[7m^Q\x1b[27m Quit        "
+              f" \x1b[7m^E\x1b[27m Edit context    "
               f" \x1b[7mEn\x1b[27m Quick append"
-              f" \x1b[7m^R\x1b[27m ASR input         \n"
-              f" \x1b[7m^P\x1b[27m Pick model    "  # NOTE might need \x1b[2K here if overwritten by context
-              f" \x1b[7m^S\x1b[27m Send to server      "
+              f" \x1b[7m^R\x1b[27m ASR input        "
+              f" \x1b[7m^X\x1b[27m shell\n"
+              f" \x1b[7m^P\x1b[27m Pick model  "  # NOTE might need \x1b[2K here if overwritten by context
+              f" \x1b[7m^S\x1b[27m Send to server  "
               f" \x1b[7m^Y\x1b[27m Load session"
-              f" \x1b[7m^T\x1b[27m TTS last message    "
+              f" \x1b[7m^T\x1b[27m TTS last message "
               f" \x1b[7m^L\x1b[27m full refresh screen", end="")
     
     if user_input or full_draw:
@@ -309,6 +329,10 @@ def draw_context_chunk(screen_size, scroll) -> None:
 
 
 ### Main Program ##########################################
+# print("STARTING YYAAII...")
+scroll: int = 0
+input_buffer: str = ""
+buffer_len: int = 0
 
 if config["auto_start_llm"]:
     start_llm_server()
@@ -318,9 +342,6 @@ if config["auto_start_asr"]:
     start_asr_server()
 session: str = load_session()
 model = $(jq .model @(session))
-scroll: int = 0
-input_buffer: str = ""
-buffer_len: int = 0
 
 print("\x1b[2J\x1b[H\x1b[?25l")
 draw_ui(full_draw=True)
@@ -360,6 +381,12 @@ while True:
     elif char == "\x0c":  # ^L force redraw the screen
         draw_ui(full_draw=True)
 
+    elif char == "\x18":  # ^X eXecute shell
+        print("\x1b[2J\x1b[H\x1b[?25l")
+        @(config["shell"])
+        print("\x1b[2J\x1b[H\x1b[?25l")
+        draw_ui(full_draw=True)
+
     elif char == "\x7f":  # Backspace
         input_buffer = input_buffer[:-1]
         draw_ui(user_input=True)
@@ -389,5 +416,8 @@ while True:
     
 
 if config["auto_kill_llm"]:
-    pkill ollama
+    try:
+        pkill ollama
+    except Exception as e:
+        log(f"couldnt kill ollama: {e}")
 print("\x1b[2J\x1b[3J\x1b[H\x1b[?25h", end="")
