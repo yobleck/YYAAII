@@ -1,0 +1,13 @@
+[Unit]
+Description= configure ip netns for ollama sandbox
+After=network.target
+
+#Wants=network-online.target
+#After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=~/ai/ollama_ip_netns_service/ollama_sandbox.sh
+
+[Install]
+WantedBy=multi-user.target
