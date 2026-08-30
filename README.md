@@ -7,11 +7,13 @@ Yobleck's Yet Another Artificial Intelligence Interface
       - requests
       - wcwidth
       - setproctitle (optional)
-  - jq
-  - ollama
-  - nnn (can be replaced in config
+  - jq (json parsing)
+  - ollama (inference engine)
+  - nnn (can be replaced in config)
   - unbuffer (expect)
   - p[grep/kill]
+  - firejail (for sandboxing ollama)
+  - switch-netns (to access ollama from outside sandbox)
   - [qwen3-tt.cpp](https://github.com/predict-woo/qwen3-tts.cpp)
       - change -DGGML_METAL to -DGGML_[CUDA/VULKAN] etc.
       - change -j4 to how many ever threads you want to run faster
