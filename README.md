@@ -22,3 +22,5 @@ Yobleck's Yet Another Artificial Intelligence Interface
  can edit built in config variable in yyaaii.xsh
 
  TODO qwen3-asr or whisper.cpp, voice design with qwen3-tts, auto create new session
+
+ Files will specify if they are AI generated. If not then they are human written.
